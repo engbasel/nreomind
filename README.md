@@ -114,6 +114,10 @@ app.register_blueprint(scans_bp, url_prefix='/api/scans')
 
 **التسجيل:**
 ```python
+from werkzeug.security import generate_password_hash
+from utils.database import get_users, save_users, get_next_id
+from utils.auth import generate_token
+
 @auth_bp.route('/register', methods=['POST'])
 def register():
     # 1. استقبال البيانات
@@ -123,63 +127,172 @@ def register():
     if not data.get('email') or not data.get('password'):
         return jsonify({'error': 'Missing data'}), 400
     
-    # 3. تشفير الباسورد
-    hashed_password = bcrypt.hashpw(
-        data['password'].encode('utf-8'), 
-        bcrypt.gensalt()
-    )
+    # 3. قراءة المستخدمين الحاليين
+    users = get_users()
     
-    # 4. حفظ المستخدم في Appwrite
-    user = account.create(...)
+    # 4. التحقق من عدم وجود المستخدم
+    if any(u['email'] == data['email'] for u in users):
+        return jsonify({'error': 'User already exists'}), 400
     
-    # 5. إنشاء JWT Token
-    token = jwt.encode({
-        'userId': user['$id'],
-        'exp': datetime.utcnow() + timedelta(days=7)
-    }, SECRET_KEY)
+    # 5. تشفير الباسورد
+    hashed_password = generate_password_hash(data['password'])
     
-    return jsonify({'token': token, 'user': user})
+    # 6. إنشاء مستخدم جديد
+    new_user = {
+        'id': get_next_id(users),
+        'email': data['email'],
+        'password': hashed_password,
+        'name': data['name'],
+        'phone': data.get('phone', ''),
+        'role': 'user',
+        'isActive': True,
+        'createdAt': datetime.now().isoformat()
+    }
+    
+    # 7. إضافة المستخدم وحفظه في الملف
+    users.append(new_user)
+    save_users(users)
+    
+    # 8. إنشاء JWT Token
+    token = generate_token(new_user)
+    
+    # 9. إرجاع الرد (بدون الباسورد)
+    user_response = {k: v for k, v in new_user.items() if k != 'password'}
+    
+    return jsonify({'accessToken': token, 'user': user_response}), 201
 ```
 
 **تسجيل الدخول:**
 ```python
+from werkzeug.security import check_password_hash
+
 @auth_bp.route('/login', methods=['POST'])
 def login():
-    # 1. التحقق من الإيميل والباسورد
-    # 2. إنشاء Session في Appwrite
-    # 3. إرجاع Token
+    data = request.get_json()
+    
+    # 1. قراءة المستخدمين
+    users = get_users()
+    
+    # 2. البحث عن المستخدم
+    user = next((u for u in users if u['email'] == data['email']), None)
+    
+    if not user:
+        return jsonify({'error': 'Invalid credentials'}), 401
+    
+    # 3. التحقق من الباسورد
+    if not check_password_hash(user['password'], data['password']):
+        return jsonify({'error': 'Invalid credentials'}), 401
+    
+    # 4. إنشاء Token
+    token = generate_token(user)
+    
+    # 5. إرجاع الرد
+    user_response = {k: v for k, v in user.items() if k != 'password'}
+    return jsonify({'accessToken': token, 'user': user_response})
 ```
 
 #### 3. routes/scans.py (إدارة الفحوصات)
 
 ```python
+from utils.database import get_db, save_db, get_next_id
+
 @scans_bp.route('', methods=['GET'])
 @require_auth  # يتطلب تسجيل دخول
 def get_scans():
     user_id = request.user_id
-    # جلب كل الفحوصات الخاصة بالمستخدم
-    scans = databases.list_documents(
-        database_id=DATABASE_ID,
-        collection_id=SCANS_COLLECTION_ID,
-        queries=[Query.equal('userId', user_id)]
-    )
-    return jsonify(scans)
+    
+    # قراءة قاعدة البيانات
+    db = get_db()
+    scans = db.get('scans', [])
+    
+    # جلب الفحوصات الخاصة بالمستخدم فقط
+    user_scans = [s for s in scans if s['userId'] == user_id]
+    
+    return jsonify(user_scans)
+
+@scans_bp.route('', methods=['POST'])
+@require_auth
+def create_scan():
+    user_id = request.user_id
+    data = request.get_json()
+    
+    # قراءة قاعدة البيانات
+    db = get_db()
+    scans = db.get('scans', [])
+    
+    # إنشاء فحص جديد
+    new_scan = {
+        'id': get_next_id(scans),
+        'userId': user_id,
+        'result': data['result'],
+        'confidence': data['confidence'],
+        'findings': data['findings'],
+        'imageUrl': data['imageUrl'],
+        'createdAt': datetime.now().isoformat()
+    }
+    
+    # إضافة وحفظ
+    scans.append(new_scan)
+    db['scans'] = scans
+    save_db(db)
+    
+    return jsonify(new_scan), 201
 ```
 
-### قاعدة البيانات: Appwrite
+### قاعدة البيانات: Local JSON Files
 
-**ليه اخترنا Appwrite؟**
-- ✅ Backend as a Service (جاهز ومش محتاج نعمل كل حاجة من الصفر)
-- ✅ فيه Authentication جاهز
-- ✅ فيه Database جاهز
-- ✅ فيه Storage للصور
-- ✅ مجاني للمشاريع الصغيرة
+**ليه استخدمنا JSON Files؟**
+- ✅ بسيطة وسهلة في التعامل
+- ✅ مش محتاجة setup معقد
+- ✅ مناسبة للمشاريع الصغيرة والـ Prototyping
+- ✅ سهل نقرأها ونعدلها يدوياً
+- ✅ مش محتاجة سيرفر database منفصل
 
-**Collections اللي عندنا:**
-- `users` - بيانات المستخدمين
-- `scans` - نتائج الفحوصات
-- `bookings` - الحجوزات
-- `doctors` - بيانات الأطباء
+**الملفات اللي عندنا (في مجلد `backend/data/`):**
+- `users.json` - بيانات المستخدمين (إيميل، باسورد مشفر، اسم، تليفون)
+- `db.json` - البيانات الرئيسية (الأطباء، الحجوزات، الفحوصات)
+- `faqs.json` - الأسئلة الشائعة
+
+**كيف بنتعامل معاها؟**
+
+```python
+# في utils/database.py
+import json
+
+def load_json_file(filename):
+    """قراءة ملف JSON"""
+    with open(f'data/{filename}', 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+def save_json_file(filename, data):
+    """حفظ بيانات في ملف JSON"""
+    with open(f'data/{filename}', 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def get_users():
+    """جلب كل المستخدمين"""
+    return load_json_file('users.json')
+
+def save_users(users):
+    """حفظ المستخدمين"""
+    save_json_file('users.json', users)
+```
+
+**مثال على بيانات في users.json:**
+```json
+[
+  {
+    "id": 1,
+    "email": "user@example.com",
+    "password": "$2b$10$hashed_password_here",
+    "name": "أحمد محمد",
+    "phone": "+20 100 123 4567",
+    "role": "user",
+    "isActive": true,
+    "createdAt": "2025-12-15T10:30:00"
+  }
+]
+```
 
 ---
 
@@ -368,8 +481,7 @@ def analyze():
 ### المتطلبات:
 - Python 3.8+
 - pip
-- حساب Appwrite
-- Gemini API Key
+- Gemini API Key (للـ Chatbot)
 
 ### خطوات التشغيل:
 
@@ -381,17 +493,19 @@ pip install -r requirements.txt
 
 #### 2. إعداد ملفات .env
 
-**للـ Main Server:**
+**للـ Main Server (flask_server/.env):**
 ```env
-APPWRITE_ENDPOINT=https://cloud.appwrite.io/v1
-APPWRITE_PROJECT_ID=your_project_id
-APPWRITE_API_KEY=your_api_key
-JWT_SECRET=your_secret_key
+PORT=5000
+JWT_SECRET=your_secret_key_here
+JWT_EXPIRES_IN=7d
+MAX_FILE_SIZE=10485760
+UPLOAD_PATH=./uploads
 ```
 
-**للـ Chatbot:**
+**للـ Chatbot (ai_services/chatbot/.env):**
 ```env
-GEMINI_API_KEY=your_gemini_key
+GEMINI_API_KEY=your_gemini_api_key_here
+PORT=5001
 ```
 
 #### 3. تشغيل جميع السيرفرات
@@ -508,7 +622,6 @@ python app.py
 ### الطالب 2: Main Server + Authentication
 - شرح Flask Server
 - شرح Authentication (JWT)
-- شرح Appwrite
 - **الوقت:** 5-7 دقائق
 
 ### الطالب 3: AI Chatbot
@@ -549,7 +662,6 @@ python app.py
 ## 📚 مصادر إضافية
 
 - [Flask Documentation](https://flask.palletsprojects.com/)
-- [Appwrite Documentation](https://appwrite.io/docs)
 - [Google Gemini API](https://ai.google.dev/docs)
 - [JWT.io](https://jwt.io/)
 - [TensorFlow/Keras](https://www.tensorflow.org/)
